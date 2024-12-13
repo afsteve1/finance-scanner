@@ -15,12 +15,16 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import io
 import re
+import sqlite3
 
 class FinanceScanner:
     def __init__(self, root):
         self.root = root
         self.root.title("Finance Statement Scanner")
         self.root.geometry("1200x800")
+        
+        # Initialize database
+        self.init_database()
         
         # Initialize account data
         self.accounts = {
@@ -41,6 +45,10 @@ class FinanceScanner:
         self.viewer_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.viewer_frame, text="Balance History")
         
+        # Create budget frame
+        self.budget_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.budget_frame, text="Budget")
+        
         # Add frames to notebook
         self.notebook.add(self.scanner_frame, text="Scanner")
         
@@ -49,6 +57,9 @@ class FinanceScanner:
         
         # Set up viewer interface
         self.setup_viewer()
+        
+        # Set up budget interface
+        self.setup_budget()
         
         self.current_image = None
 
@@ -185,6 +196,215 @@ class FinanceScanner:
                 'current': current_bal,
                 'change': change
             }
+
+    def setup_budget(self):
+        # Create top frame for controls
+        control_frame = ttk.Frame(self.budget_frame)
+        control_frame.pack(fill='x', padx=5, pady=5)
+        
+        # Year selector
+        ttk.Label(control_frame, text="Year:").pack(side='left', padx=5)
+        self.year_var = tk.StringVar(value=str(datetime.now().year))
+        year_entry = ttk.Entry(control_frame, textvariable=self.year_var, width=6)
+        year_entry.pack(side='left', padx=5)
+        
+        # Add category button
+        add_cat_btn = ttk.Button(control_frame, text="Add Category", command=self.add_budget_category)
+        add_cat_btn.pack(side='left', padx=5)
+        
+        # Create treeview for budget
+        self.budget_tree = ttk.Treeview(self.budget_frame, show='headings')
+        
+        # Configure columns
+        columns = ['Category'] + [f'{m[:3]}' for m in ['January', 'February', 'March', 'April', 'May', 'June', 
+                                                      'July', 'August', 'September', 'October', 'November', 'December']] + ['Total']
+        self.budget_tree['columns'] = columns
+        
+        # Configure column headings
+        for col in columns:
+            self.budget_tree.heading(col, text=col)
+            width = 100 if col == 'Category' else 70
+            self.budget_tree.column(col, width=width, anchor='e')
+        
+        # Add scrollbars
+        y_scroll = ttk.Scrollbar(self.budget_frame, orient='vertical', command=self.budget_tree.yview)
+        x_scroll = ttk.Scrollbar(self.budget_frame, orient='horizontal', command=self.budget_tree.xview)
+        self.budget_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        
+        # Pack everything
+        self.budget_tree.pack(fill='both', expand=True)
+        y_scroll.pack(side='right', fill='y')
+        x_scroll.pack(side='bottom', fill='x')
+        
+        # Bind double-click event for editing
+        self.budget_tree.bind('<Double-1>', self.edit_budget_item)
+        
+        # Load saved budget data if exists
+        self.load_budget_data()
+
+    def init_database(self):
+        # Create database connection
+        self.conn = sqlite3.connect('finance_scanner.db')
+        self.cursor = self.conn.cursor()
+        
+        # Create budget table if it doesn't exist
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budget_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_name TEXT NOT NULL
+            )
+        ''')
+        
+        # Create budget amounts table if it doesn't exist
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budget_amounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
+                year INTEGER,
+                month INTEGER,
+                amount REAL,
+                FOREIGN KEY (category_id) REFERENCES budget_categories (id),
+                UNIQUE(category_id, year, month)
+            )
+        ''')
+        
+        self.conn.commit()
+
+    def add_budget_category(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Budget Category")
+        dialog.geometry("300x100")
+        
+        ttk.Label(dialog, text="Category Name:").pack(padx=5, pady=5)
+        entry = ttk.Entry(dialog)
+        entry.pack(padx=5, pady=5)
+        
+        def add():
+            category = entry.get().strip()
+            if category:
+                # Check if category already exists
+                self.cursor.execute('SELECT id FROM budget_categories WHERE category_name = ?', (category,))
+                if self.cursor.fetchone():
+                    messagebox.showerror("Error", "Category already exists")
+                    return
+                
+                values = [category] + ['0.00'] * 12 + ['0.00']
+                self.budget_tree.insert('', 'end', values=values)
+                self.calculate_totals()
+                self.save_budget_data()
+                dialog.destroy()
+        
+        ttk.Button(dialog, text="Add", command=add).pack(pady=10)
+
+    def edit_budget_item(self, event):
+        item = self.budget_tree.selection()[0]
+        column = self.budget_tree.identify_column(event.x)
+        col_num = int(column[1]) - 1
+        
+        if col_num == 0:  # Category name
+            return
+        
+        if col_num == 13:  # Total column
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Amount")
+        dialog.geometry("200x100")
+        
+        current_value = self.budget_tree.item(item)['values'][col_num]
+        
+        ttk.Label(dialog, text="Amount:").pack(padx=5, pady=5)
+        entry = ttk.Entry(dialog)
+        entry.insert(0, current_value)
+        entry.pack(padx=5, pady=5)
+        
+        def update():
+            try:
+                new_value = float(entry.get())
+                values = list(self.budget_tree.item(item)['values'])
+                values[col_num] = f"{new_value:.2f}"
+                self.budget_tree.item(item, values=values)
+                self.calculate_totals()
+                self.save_budget_data()
+                dialog.destroy()
+            except ValueError:
+                messagebox.showerror("Error", "Please enter a valid number")
+        
+        ttk.Button(dialog, text="Update", command=update).pack(pady=10)
+
+    def calculate_totals(self):
+        for item in self.budget_tree.get_children():
+            values = list(self.budget_tree.item(item)['values'])
+            total = sum(float(x) for x in values[1:13])  # Sum all months
+            values[13] = f"{total:.2f}"
+            self.budget_tree.item(item, values=values)
+
+    def save_budget_data(self):
+        try:
+            for item in self.budget_tree.get_children():
+                values = self.budget_tree.item(item)['values']
+                category_name = values[0]
+                year = int(self.year_var.get())
+                
+                # Get or create category
+                self.cursor.execute('SELECT id FROM budget_categories WHERE category_name = ?', (category_name,))
+                result = self.cursor.fetchone()
+                
+                if result:
+                    category_id = result[0]
+                else:
+                    self.cursor.execute('INSERT INTO budget_categories (category_name) VALUES (?)', (category_name,))
+                    category_id = self.cursor.lastrowid
+                
+                # Save monthly amounts
+                for month in range(12):
+                    amount = float(values[month + 1])
+                    self.cursor.execute('''
+                        INSERT OR REPLACE INTO budget_amounts (category_id, year, month, amount)
+                        VALUES (?, ?, ?, ?)
+                    ''', (category_id, year, month + 1, amount))
+            
+            self.conn.commit()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save budget data: {str(e)}")
+    
+    def load_budget_data(self):
+        try:
+            # Clear existing items
+            for item in self.budget_tree.get_children():
+                self.budget_tree.delete(item)
+            
+            year = int(self.year_var.get())
+            
+            # Get all categories and their amounts
+            self.cursor.execute('''
+                SELECT 
+                    c.category_name,
+                    GROUP_CONCAT(a.amount) as amounts
+                FROM budget_categories c
+                LEFT JOIN budget_amounts a ON c.id = a.category_id 
+                    AND a.year = ?
+                GROUP BY c.id, c.category_name
+                ORDER BY c.category_name
+            ''', (year,))
+            
+            results = self.cursor.fetchall()
+            
+            for category_name, amounts in results:
+                if amounts:
+                    amounts = [float(x) if x else 0.0 for x in amounts.split(',')]
+                else:
+                    amounts = [0.0] * 12
+                    
+                # Calculate total
+                total = sum(amounts)
+                
+                # Format values
+                values = [category_name] + [f"{amount:.2f}" for amount in amounts] + [f"{total:.2f}"]
+                self.budget_tree.insert('', 'end', values=values)
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load budget data: {str(e)}")
 
     def refresh_data(self):
         try:
